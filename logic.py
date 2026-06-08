@@ -5,6 +5,7 @@ No MCP dependency here — importable standalone and in tests.
 server.py wraps these functions as MCP tools.
 """
 
+from __future__ import annotations
 import email
 import imaplib
 import os
@@ -16,12 +17,15 @@ from email.utils import formatdate, make_msgid
 
 # ── Config from environment ───────────────────────────────────────────────────
 
-EMAIL_ADDRESS  = os.environ.get("EMAIL_ADDRESS",   "")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD",  "")
-IMAP_HOST      = os.environ.get("EMAIL_IMAP_HOST", "")
-IMAP_PORT      = int(os.environ.get("EMAIL_IMAP_PORT", "993"))
-SMTP_HOST      = os.environ.get("EMAIL_SMTP_HOST", "")
-SMTP_PORT      = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+EMAIL_ADDRESS      = os.environ.get("EMAIL_ADDRESS",              "")
+EMAIL_PASSWORD     = os.environ.get("EMAIL_PASSWORD",             "")
+IMAP_HOST          = os.environ.get("EMAIL_IMAP_HOST",           "")
+IMAP_PORT          = int(os.environ.get("EMAIL_IMAP_PORT",       "993"))
+SMTP_HOST          = os.environ.get("EMAIL_SMTP_HOST",           "")
+SMTP_PORT          = int(os.environ.get("EMAIL_SMTP_PORT",      "465"))
+SMTP_USE_STARTTLS    = os.environ.get("EMAIL_SMTP_USE_STARTTLS",    "")
+SMTP_USE_IMPLICIT_SSL = os.environ.get("EMAIL_SMTP_USE_IMPLICIT_SSL", "")
+SENDER_NAME        = os.environ.get("EMAIL_SENDER_NAME",         "")
 
 # ── Reply-loop detection ──────────────────────────────────────────────────────
 
@@ -201,8 +205,9 @@ def do_send_reply(
     """Send a reply via SMTP with an explicit Date header."""
     try:
         msg = MIMEMultipart("alternative")
-        msg["From"]       = EMAIL_ADDRESS
-        msg["To"]         = to
+        from_header = EMAIL_ADDRESS if not SENDER_NAME else f"{SENDER_NAME} <{EMAIL_ADDRESS}>"
+        msg["From"]    = from_header
+        msg["To"]      = to
         msg["Subject"]    = subject
         msg["Date"]       = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid(domain=EMAIL_ADDRESS.split("@")[-1])
@@ -214,12 +219,28 @@ def do_send_reply(
             )
             msg["References"] = " ".join(all_refs)
         msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        use_implicit = SMTP_USE_IMPLICIT_SSL == "1" or (
+            SMTP_PORT == 465 and SMTP_USE_STARTTLS != "1"
+        )
+        use_starttls  = SMTP_USE_STARTTLS == "1" or (
+            SMTP_PORT == 587 and SMTP_USE_IMPLICIT_SSL != "1"
+        )
         context = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
+
+        if use_implicit:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
+                server.ehlo()
+                server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.ehlo()
+                if use_starttls:
+                    server.starttls(context=context)
+                server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
+
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}

@@ -7,12 +7,13 @@ Exposes four tools to Hermes Agent over stdio transport:
 
   fetch_unread   Unread emails with thread context. Automated mail silently archived.
   send_reply     SMTP send with explicit RFC 5322 Date header.
-  mark_read      Mark a message \\Seen.
+  mark_read      Mark a message \Seen.
   archive        Move a message to archive without replying.
 
 Usage: Hermes spawns this automatically via mcp_servers in config/config.yaml.
 """
 
+from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from email_sidecar.logic import (
