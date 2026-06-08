@@ -130,7 +130,10 @@ def imap_connect() -> imaplib.IMAP4_SSL:
 def move_to_archive(conn: imaplib.IMAP4_SSL, uid: bytes) -> None:
     """Move a message to an archive folder; fall back to mark-read if none found."""
     for folder in ("[Gmail]/All Mail", "Archive", "INBOX.Archive", "Archived", "Trash"):
-        result, _ = conn.copy(uid, folder)
+        try:
+            result, _ = conn.copy(uid, folder)
+        except Exception:
+            continue
         if result == "OK":
             conn.store(uid, "+FLAGS", "\\Deleted")
             conn.expunge()
