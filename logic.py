@@ -154,7 +154,7 @@ def fetch_thread_context(
         if typ != "OK" or not data[0]:
             continue
         for uid in data[0].split()[:1]:
-            typ2, msg_data = conn.fetch(uid, "(RFC822)")
+            typ2, msg_data = conn.fetch(uid, "(BODY.PEEK[])")
             if typ2 != "OK" or not msg_data or not msg_data[0]:
                 continue
             ancestor = email.message_from_bytes(msg_data[0][1])
@@ -179,7 +179,7 @@ def do_fetch_unread() -> list[dict]:
         if typ != "OK" or not data[0]:
             return []
         for uid in data[0].split():
-            typ2, msg_data = conn.fetch(uid, "(RFC822)")
+            typ2, msg_data = conn.fetch(uid, "(BODY.PEEK[])")
             if typ2 != "OK" or not msg_data or not msg_data[0]:
                 continue
             msg = email.message_from_bytes(msg_data[0][1])
