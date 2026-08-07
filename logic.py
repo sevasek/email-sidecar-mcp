@@ -15,6 +15,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 
+from email_sidecar import send_lock
+
 # ── Config from environment ───────────────────────────────────────────────────
 
 EMAIL_ADDRESS      = os.environ.get("EMAIL_ADDRESS",              "")
@@ -198,14 +200,43 @@ def do_fetch_unread() -> list[dict]:
     return results
 
 
+def do_queue_draft(email_id: str) -> dict:
+    """Register a posted draft as pending owner approval, keyed by the 'id' field from fetch_unread (the IMAP uid, i.e. the Telegram message's Email-ID)."""
+    return send_lock.queue_draft(email_id)
+
+
+def do_approve_send(email_id: str) -> dict:
+    """Approve a queued draft for sending. Only the owner-reply session should call this."""
+    return send_lock.approve_send(email_id)
+
+
+def do_discard_draft(email_id: str) -> dict:
+    """Drop a queued draft without sending it."""
+    return send_lock.discard(email_id)
+
+
 def do_send_reply(
     to: str,
     subject: str,
     body: str,
     in_reply_to: str = "",
     references: list[str] | None = None,
+    email_id: str = "",
 ) -> dict:
-    """Send a reply via SMTP with an explicit Date header."""
+    """Send a reply via SMTP with an explicit Date header.
+
+    Refuses to send unless email_id (the Email-ID/uid the draft was queued
+    under) has a matching lock that was explicitly approved via
+    approve_send — see send_lock.py. email_id is independent of in_reply_to,
+    which remains the RFC Message-ID used for the outgoing In-Reply-To header.
+    """
+    if not send_lock.is_approved(email_id):
+        return {
+            "ok": False,
+            "error": "send_locked: no approved draft for this email_id. "
+                     "Call queue_draft after posting to Telegram, then approve_send "
+                     "once the owner actually replies 'send'.",
+        }
     try:
         msg = MIMEMultipart("alternative")
         from_header = EMAIL_ADDRESS if not SENDER_NAME else f"{SENDER_NAME} <{EMAIL_ADDRESS}>"
@@ -244,6 +275,7 @@ def do_send_reply(
                 server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
                 server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
 
+        send_lock.discard(email_id)
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}

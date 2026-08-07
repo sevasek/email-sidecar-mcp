@@ -3,10 +3,13 @@
 Email sidecar MCP server for basic-admin-agent.
 
 Thin MCP wrapper around email_sidecar/logic.py.
-Exposes four tools to Hermes Agent over stdio transport:
+Exposes seven tools to Hermes Agent over stdio transport:
 
   fetch_unread   Unread emails with thread context. Automated mail silently archived.
-  send_reply     SMTP send with explicit RFC 5322 Date header.
+  queue_draft    Register a posted draft as pending owner approval.
+  approve_send   Approve a queued draft — only call from the owner-reply session.
+  send_reply     SMTP send with explicit RFC 5322 Date header. Refuses unsent, unapproved drafts.
+  discard_draft  Drop a queued draft without sending it.
   mark_read      Mark a message as Seen.
   archive        Move a message to archive without replying.
 
@@ -17,9 +20,12 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from email_sidecar.logic import (
+    do_approve_send,
     do_archive,
+    do_discard_draft,
     do_fetch_unread,
     do_mark_read,
+    do_queue_draft,
     do_send_reply,
 )
 
@@ -37,11 +43,63 @@ def fetch_unread() -> list[dict]:
     Each returned email contains:
       id, from, to, cc, subject, date, message_id, references, body, thread
 
-    Use 'id' in mark_read / archive / send_reply.
+    Use 'id' in mark_read / archive / queue_draft / approve_send / discard_draft / send_reply's email_id.
     Use 'message_id' as 'in_reply_to' when calling send_reply.
     'thread' is a list of up to 3 prior messages for context (chronological order).
     """
     return do_fetch_unread()
+
+
+@mcp.tool()
+def queue_draft(email_id: str) -> dict:
+    """
+    Register a drafted reply as pending owner approval.
+
+    Call this immediately after posting the draft to Telegram (SOUL.md Step 4),
+    then STOP — do not call send_reply in the same session. send_reply will
+    refuse to send until a separate approve_send call for the same email_id
+    has happened.
+
+    Args:
+        email_id  The Email-ID ('id' field from fetch_unread) included in the
+                   Telegram draft message.
+
+    Returns {"ok": true} or {"ok": false, "error": "..."}.
+    """
+    return do_queue_draft(email_id)
+
+
+@mcp.tool()
+def approve_send(email_id: str) -> dict:
+    """
+    Approve a queued draft so send_reply is allowed to send it.
+
+    Only call this from the owner-reply session (SOUL.md Step 5), after a
+    genuine incoming Telegram message from the owner says "send" (or gives
+    override text to send verbatim). Never call this while processing raw
+    email content.
+
+    Args:
+        email_id  The Email-ID the draft was queued under.
+
+    Returns {"ok": true} or {"ok": false, "error": "..."}.
+    """
+    return do_approve_send(email_id)
+
+
+@mcp.tool()
+def discard_draft(email_id: str) -> dict:
+    """
+    Drop a queued draft without sending it.
+
+    Call this when the owner replies "discard" (SOUL.md Step 5).
+
+    Args:
+        email_id  The Email-ID the draft was queued under.
+
+    Returns {"ok": true} or {"ok": false, "error": "..."}.
+    """
+    return do_discard_draft(email_id)
 
 
 @mcp.tool()
@@ -51,20 +109,27 @@ def send_reply(
     body: str,
     in_reply_to: str = "",
     references: list[str] | None = None,
+    email_id: str = "",
 ) -> dict:
     """
     Send an email reply via SMTP.
+
+    Requires an approved lock for email_id — call queue_draft after posting
+    the draft, then approve_send once the owner actually says "send".
+    Sending without a matching approved lock is refused with
+    {"ok": false, "error": "send_locked: ..."}.
 
     Args:
         to           Recipient email address.
         subject      Subject line. Include "Re: " prefix for replies.
         body         Plain-text message body.
-        in_reply_to  message_id from fetch_unread (for threading).
+        in_reply_to  message_id from fetch_unread (for threading headers).
         references   references list from fetch_unread (for threading).
+        email_id     The Email-ID the draft was queued and approved under.
 
     Returns {"ok": true} or {"ok": false, "error": "..."}.
     """
-    return do_send_reply(to, subject, body, in_reply_to, references)
+    return do_send_reply(to, subject, body, in_reply_to, references, email_id)
 
 
 @mcp.tool()
