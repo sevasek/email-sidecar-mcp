@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Email sidecar MCP server for basic-admin-agent.
+Email sidecar MCP server.
 
 Thin MCP wrapper around email_sidecar/logic.py.
-Exposes seven tools to Hermes Agent over stdio transport:
+Exposes seven tools to an MCP client (e.g. Hermes Agent) over stdio transport:
 
   fetch_unread   Unread emails with thread context. Automated mail silently archived.
   queue_draft    Register a posted draft as pending owner approval.
@@ -13,7 +13,7 @@ Exposes seven tools to Hermes Agent over stdio transport:
   mark_read      Mark a message as Seen.
   archive        Move a message to archive without replying.
 
-Usage: Hermes spawns this automatically via mcp_servers in config/config.yaml.
+See README.md for configuration and consuming-project wiring.
 """
 
 from __future__ import annotations
@@ -160,5 +160,9 @@ def archive(message_id: str) -> dict:
     return do_archive(message_id)
 
 
-if __name__ == "__main__":
+def main() -> None:
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

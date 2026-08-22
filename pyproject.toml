@@ -1,0 +1,24 @@
+[project]
+name = "email-sidecar-mcp"
+version = "0.1.0"
+description = "Thin imaplib/smtplib MCP server exposing inbox read/draft/send tools to an MCP client."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0,<2.0",
+]
+
+[project.scripts]
+email-sidecar-mcp = "email_sidecar.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["email_sidecar"]
