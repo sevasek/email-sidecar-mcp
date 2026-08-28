@@ -11,6 +11,7 @@ import imaplib
 import os
 import smtplib
 import ssl
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
@@ -127,6 +128,34 @@ def imap_connect() -> imaplib.IMAP4_SSL:
     conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     conn.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
     return conn
+
+
+def append_to_sent(msg_bytes: bytes) -> None:
+    """Best-effort copy of a just-sent message into the Sent folder.
+
+    SMTP has no concept of folders, so a raw smtplib send delivers the
+    message but leaves no trace in the mailbox's Sent view — that's a
+    client-side responsibility every normal MUA (webmail included) handles
+    by IMAP-appending a copy after sending. Failure here must never surface
+    as a send failure: the message has already gone out over SMTP by the
+    time this runs, so we swallow errors rather than raise.
+    """
+    try:
+        conn = imap_connect()
+        try:
+            for folder in ("Sent", "INBOX.Sent", "[Gmail]/Sent Mail", "Sent Items"):
+                try:
+                    result, _ = conn.append(
+                        folder, "\\Seen", imaplib.Time2Internaldate(time.time()), msg_bytes
+                    )
+                except Exception:
+                    continue
+                if result == "OK":
+                    break
+        finally:
+            conn.logout()
+    except Exception:
+        pass
 
 
 def move_to_archive(conn: imaplib.IMAP4_SSL, uid: bytes) -> None:
@@ -275,6 +304,7 @@ def do_send_reply(
                 server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
                 server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
 
+        append_to_sent(msg.as_bytes())
         send_lock.discard(email_id)
         return {"ok": True}
     except Exception as exc:

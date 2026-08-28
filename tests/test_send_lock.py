@@ -169,3 +169,44 @@ class TestSendReplyLockGate:
         send_lock.approve_send("1")
         result = do_send_reply("a@b.com", "Re: hi", "body", email_id="2")
         assert result["ok"] is False
+
+
+# ── append_to_sent (Sent-folder visibility, separate from delivery) ───────────
+
+class TestAppendToSent:
+
+    def test_successful_send_appends_a_copy_to_sent(self):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        imap_conn = MagicMock()
+        imap_conn.append.return_value = ("OK", [b""])
+        with patch("smtplib.SMTP_SSL", return_value=_smtp_mock()), \
+             patch("email_sidecar.logic.imap_connect", return_value=imap_conn):
+            result = do_send_reply("a@b.com", "Re: hi", "body", email_id="1")
+        assert result == {"ok": True}
+        imap_conn.append.assert_called_once()
+        folder = imap_conn.append.call_args[0][0]
+        assert folder == "Sent"
+        imap_conn.logout.assert_called_once()
+
+    def test_imap_append_failure_does_not_fail_the_send(self):
+        """The SMTP send has already gone out by the time we try to file a
+        Sent copy — a broken/unreachable IMAP connection must never turn an
+        otherwise-successful send into a reported failure."""
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        with patch("smtplib.SMTP_SSL", return_value=_smtp_mock()), \
+             patch("email_sidecar.logic.imap_connect", side_effect=OSError("unreachable")):
+            result = do_send_reply("a@b.com", "Re: hi", "body", email_id="1")
+        assert result == {"ok": True}
+
+    def test_falls_back_to_next_folder_name_if_first_fails(self):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        imap_conn = MagicMock()
+        imap_conn.append.side_effect = [("NO", [b"no such mailbox"]), ("OK", [b""])]
+        with patch("smtplib.SMTP_SSL", return_value=_smtp_mock()), \
+             patch("email_sidecar.logic.imap_connect", return_value=imap_conn):
+            result = do_send_reply("a@b.com", "Re: hi", "body", email_id="1")
+        assert result == {"ok": True}
+        assert imap_conn.append.call_count == 2
