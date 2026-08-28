@@ -110,6 +110,7 @@ def send_reply(
     in_reply_to: str = "",
     references: list[str] | None = None,
     email_id: str = "",
+    cc: list[str] | None = None,
 ) -> dict:
     """
     Send an email reply via SMTP.
@@ -126,10 +127,14 @@ def send_reply(
         in_reply_to  message_id from fetch_unread (for threading headers).
         references   references list from fetch_unread (for threading).
         email_id     The Email-ID the draft was queued and approved under.
+        cc           Optional list of CC recipient addresses. They receive
+                      the message and appear in the visible Cc header —
+                      include anyone the owner wants kept in the loop (e.g.
+                      a 'cc' address from fetch_unread's original thread).
 
     Returns {"ok": true} or {"ok": false, "error": "..."}.
     """
-    return do_send_reply(to, subject, body, in_reply_to, references, email_id)
+    return do_send_reply(to, subject, body, in_reply_to, references, email_id, cc)
 
 
 @mcp.tool()

@@ -251,6 +251,7 @@ def do_send_reply(
     in_reply_to: str = "",
     references: list[str] | None = None,
     email_id: str = "",
+    cc: list[str] | None = None,
 ) -> dict:
     """Send a reply via SMTP with an explicit Date header.
 
@@ -258,6 +259,10 @@ def do_send_reply(
     under) has a matching lock that was explicitly approved via
     approve_send — see send_lock.py. email_id is independent of in_reply_to,
     which remains the RFC Message-ID used for the outgoing In-Reply-To header.
+
+    cc, if given, is added both as an envelope recipient (so the addresses
+    actually receive the message — setting the Cc header alone does not)
+    and as the visible Cc header.
     """
     if not send_lock.is_approved(email_id):
         return {
@@ -267,10 +272,13 @@ def do_send_reply(
                      "once the owner actually replies 'send'.",
         }
     try:
+        cc = cc or []
         msg = MIMEMultipart("alternative")
         from_header = EMAIL_ADDRESS if not SENDER_NAME else f"{SENDER_NAME} <{EMAIL_ADDRESS}>"
         msg["From"]    = from_header
         msg["To"]      = to
+        if cc:
+            msg["Cc"] = ", ".join(cc)
         msg["Subject"]    = subject
         msg["Date"]       = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid(domain=EMAIL_ADDRESS.split("@")[-1])
@@ -290,19 +298,20 @@ def do_send_reply(
             SMTP_PORT == 587 and SMTP_USE_IMPLICIT_SSL != "1"
         )
         context = ssl.create_default_context()
+        envelope_recipients = [to] + cc
 
         if use_implicit:
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
                 server.ehlo()
                 server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-                server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
+                server.sendmail(EMAIL_ADDRESS, envelope_recipients, msg.as_bytes())
         else:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
                 server.ehlo()
                 if use_starttls:
                     server.starttls(context=context)
                 server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-                server.sendmail(EMAIL_ADDRESS, [to], msg.as_bytes())
+                server.sendmail(EMAIL_ADDRESS, envelope_recipients, msg.as_bytes())
 
         append_to_sent(msg.as_bytes())
         send_lock.discard(email_id)

@@ -171,6 +171,51 @@ class TestSendReplyLockGate:
         assert result["ok"] is False
 
 
+# ── CC support ──────────────────────────────────────────────────────────────
+
+class TestCcSupport:
+
+    def test_cc_recipients_receive_the_envelope_and_the_header(self):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        server = _smtp_mock()
+        with patch("smtplib.SMTP_SSL", return_value=server):
+            result = do_send_reply(
+                "craig@example.com", "Re: hi", "body", email_id="1",
+                cc=["david@example.com"],
+            )
+        assert result == {"ok": True}
+        args, _ = server.sendmail.call_args
+        from_addr, envelope_recipients, raw_message = args
+        assert envelope_recipients == ["craig@example.com", "david@example.com"]
+        assert b"Cc: david@example.com" in raw_message
+
+    def test_multiple_cc_recipients(self):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        server = _smtp_mock()
+        with patch("smtplib.SMTP_SSL", return_value=server):
+            do_send_reply(
+                "craig@example.com", "Re: hi", "body", email_id="1",
+                cc=["david@example.com", "sashka@example.com"],
+            )
+        _, envelope_recipients, raw_message = server.sendmail.call_args[0]
+        assert envelope_recipients == [
+            "craig@example.com", "david@example.com", "sashka@example.com",
+        ]
+        assert b"Cc: david@example.com, sashka@example.com" in raw_message
+
+    def test_no_cc_omits_the_header_and_only_envelopes_to(self):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        server = _smtp_mock()
+        with patch("smtplib.SMTP_SSL", return_value=server):
+            do_send_reply("craig@example.com", "Re: hi", "body", email_id="1")
+        _, envelope_recipients, raw_message = server.sendmail.call_args[0]
+        assert envelope_recipients == ["craig@example.com"]
+        assert b"Cc:" not in raw_message
+
+
 # ── append_to_sent (Sent-folder visibility, separate from delivery) ───────────
 
 class TestAppendToSent:
