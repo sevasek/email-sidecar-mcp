@@ -251,8 +251,8 @@ class TestSendReplyAttachments:
     def test_path_outside_attachments_dir_is_rejected(self, tmp_path):
         send_lock.queue_draft("1")
         send_lock.approve_send("1")
-        secret = tmp_path / "send_locks.json"
-        secret.write_text("{}")
+        secret = tmp_path / "host-secret.env"
+        secret.write_text("EMAIL_PASSWORD=hunter2")
 
         server = _smtp_mock()
         with patch("smtplib.SMTP_SSL", return_value=server):
