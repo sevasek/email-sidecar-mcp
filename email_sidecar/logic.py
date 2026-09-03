@@ -8,13 +8,17 @@ server.py wraps these functions as MCP tools.
 from __future__ import annotations
 import email
 import imaplib
+import mimetypes
 import os
 import smtplib
 import ssl
 import time
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
+from pathlib import Path
 
 from email_sidecar import send_lock
 
@@ -107,18 +111,82 @@ def parse_references(msg: email.message.Message) -> list[str]:
     return result
 
 
+def extract_attachments(msg: email.message.Message) -> list[dict]:
+    """Return non-body parts (explicit attachments + named inline parts) with raw bytes.
+
+    A part counts as an attachment if it's flagged Content-Disposition:
+    attachment, or it carries a filename at all (covers inline images/files
+    some clients send without an explicit disposition). get_body() already
+    excludes anything with "attachment" in its disposition from the body
+    text, so the two don't double up on a plain attachment.
+    """
+    attachments = []
+    if not msg.is_multipart():
+        return attachments
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disposition = str(part.get("Content-Disposition", ""))
+        filename = part.get_filename()
+        if not filename and "attachment" not in disposition.lower():
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        attachments.append({
+            "filename":     filename or "attachment",
+            "content_type": part.get_content_type(),
+            "size":         len(payload),
+            "payload":      payload,
+        })
+    return attachments
+
+
+def _attachments_base_dir() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "/opt/data")) / "attachments"
+
+
+def save_attachments(uid: str, attachments: list[dict]) -> list[dict]:
+    """Persist extracted attachment bytes to disk, keyed by message uid.
+
+    Returns metadata dicts (filename, content_type, size, path) with the raw
+    payload dropped — the path is what Hermes/Willow actually needs to pick
+    the file back up and forward it on (e.g. via Telegram).
+    """
+    if not attachments:
+        return []
+    out_dir = _attachments_base_dir() / uid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for i, att in enumerate(attachments):
+        safe_name = os.path.basename(att["filename"]) or f"attachment-{i}"
+        path = out_dir / safe_name
+        if path.exists():
+            stem, suffix = os.path.splitext(safe_name)
+            path = out_dir / f"{stem}-{i}{suffix}"
+        path.write_bytes(att["payload"])
+        saved.append({
+            "filename":     att["filename"],
+            "content_type": att["content_type"],
+            "size":         att["size"],
+            "path":         str(path),
+        })
+    return saved
+
+
 def message_to_dict(uid: bytes, msg: email.message.Message) -> dict:
     """Convert a parsed email.message.Message to a plain dict for Hermes."""
     return {
-        "id":         uid.decode(),
-        "from":       msg.get("From", ""),
-        "to":         msg.get("To", ""),
-        "cc":         msg.get("Cc", ""),
-        "subject":    msg.get("Subject", ""),
-        "date":       msg.get("Date", ""),
-        "message_id": msg.get("Message-ID", "").strip(),
-        "references": parse_references(msg),
-        "body":       get_body(msg),
+        "id":          uid.decode(),
+        "from":        msg.get("From", ""),
+        "to":          msg.get("To", ""),
+        "cc":          msg.get("Cc", ""),
+        "subject":     msg.get("Subject", ""),
+        "date":        msg.get("Date", ""),
+        "message_id":  msg.get("Message-ID", "").strip(),
+        "references":  parse_references(msg),
+        "body":        get_body(msg),
+        "attachments": [],
     }
 
 
@@ -218,6 +286,7 @@ def do_fetch_unread() -> list[dict]:
                 move_to_archive(conn, uid)
                 continue
             record = message_to_dict(uid, msg)
+            record["attachments"] = save_attachments(record["id"], extract_attachments(msg))
             record["thread"] = fetch_thread_context(conn, record["references"])
             results.append(record)
     finally:
@@ -244,6 +313,20 @@ def do_discard_draft(email_id: str) -> dict:
     return send_lock.discard(email_id)
 
 
+def _attach_file(msg: MIMEMultipart, path: str) -> None:
+    """Read a local file and attach it to msg. Raises FileNotFoundError if missing."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"attachment not found: {path}")
+    content_type, _ = mimetypes.guess_type(file_path.name)
+    maintype, _, subtype = (content_type or "application/octet-stream").partition("/")
+    part = MIMEBase(maintype, subtype or "octet-stream")
+    part.set_payload(file_path.read_bytes())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename=file_path.name)
+    msg.attach(part)
+
+
 def do_send_reply(
     to: str,
     subject: str,
@@ -252,6 +335,7 @@ def do_send_reply(
     references: list[str] | None = None,
     email_id: str = "",
     cc: list[str] | None = None,
+    attachments: list[str] | None = None,
 ) -> dict:
     """Send a reply via SMTP with an explicit Date header.
 
@@ -263,6 +347,11 @@ def do_send_reply(
     cc, if given, is added both as an envelope recipient (so the addresses
     actually receive the message — setting the Cc header alone does not)
     and as the visible Cc header.
+
+    attachments, if given, is a list of local file paths (e.g. a path
+    fetch_unread saved an inbound attachment to, or a file Willow was handed
+    another way) to attach to the outgoing message. A missing file fails the
+    whole send rather than going out silently without it.
     """
     if not send_lock.is_approved(email_id):
         return {
@@ -273,7 +362,13 @@ def do_send_reply(
         }
     try:
         cc = cc or []
-        msg = MIMEMultipart("alternative")
+        attachments = attachments or []
+        body_part = MIMEMultipart("alternative")
+        body_part.attach(MIMEText(body, "plain", "utf-8"))
+        msg = MIMEMultipart("mixed") if attachments else body_part
+        if attachments:
+            msg.attach(body_part)
+
         from_header = EMAIL_ADDRESS if not SENDER_NAME else f"{SENDER_NAME} <{EMAIL_ADDRESS}>"
         msg["From"]    = from_header
         msg["To"]      = to
@@ -289,7 +384,8 @@ def do_send_reply(
                 [in_reply_to] if in_reply_to and in_reply_to not in references else []
             )
             msg["References"] = " ".join(all_refs)
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        for path in attachments:
+            _attach_file(msg, path)
 
         use_implicit = SMTP_USE_IMPLICIT_SSL == "1" or (
             SMTP_PORT == 465 and SMTP_USE_STARTTLS != "1"

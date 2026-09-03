@@ -25,13 +25,27 @@ Two things stay out of the LLM's hands by design:
 
 | Tool | Purpose |
 |---|---|
-| `fetch_unread` | Unread emails with up to 3 messages of thread context. Automated mail silently archived. |
+| `fetch_unread` | Unread emails with up to 3 messages of thread context and any attachments saved to disk. Automated mail silently archived. |
 | `queue_draft` | Register a posted draft as pending owner approval. |
 | `approve_send` | Approve a queued draft — call only from the owner-reply/approval path. |
-| `send_reply` | SMTP send with explicit RFC 5322 `Date` header. Refuses unsent/unapproved drafts. |
+| `send_reply` | SMTP send with explicit RFC 5322 `Date` header and optional attachments. Refuses unsent/unapproved drafts. |
 | `discard_draft` | Drop a queued draft without sending it. |
 | `mark_read` | Mark a message as Seen. |
 | `archive` | Move a message to archive without replying. |
+
+### Attachments
+
+`fetch_unread` saves each inbound attachment under
+`$HERMES_HOME/attachments/<email-id>/<filename>` and returns its metadata —
+`{filename, content_type, size, path}` — in that message's `attachments`
+list. Nothing is inlined as base64 into the tool response; the path is a
+local file the calling process (Hermes/Willow) reads directly, since the
+stdio MCP transport means it already shares this filesystem.
+
+`send_reply` accepts an `attachments` arg — a list of local file paths
+(an inbound attachment's `path`, or any other file readable on this host)
+to attach to the outgoing message. A missing path fails the send rather
+than going out silently without it.
 
 ## Install
 
