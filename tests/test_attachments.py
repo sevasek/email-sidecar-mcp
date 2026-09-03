@@ -108,6 +108,16 @@ class TestExtractAttachments:
         msg = make_msg_with_attachment()
         assert get_body(msg) == "See attached."
 
+    def test_oversized_part_is_flagged_and_not_decoded_as_payload(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_MAX_ATTACHMENT_BYTES", "16")
+        content = b"x" * 64
+        msg = make_msg_with_attachment(content=content)
+        atts = extract_attachments(msg)
+        assert len(atts) == 1
+        assert atts[0]["payload"] is None
+        assert "exceeds" in atts[0]["error"]
+        assert atts[0]["size"] > 16
+
 
 # ── save_attachments ─────────────────────────────────────────────────────────
 
@@ -151,6 +161,39 @@ class TestSaveAttachments:
         contents = {open(p, "rb").read() for p in paths}
         assert contents == {b"1", b"2"}
 
+    def test_oversized_payload_is_not_written(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("EMAIL_MAX_ATTACHMENT_BYTES", "8")
+        saved = save_attachments("42", [{
+            "filename": "big.bin", "content_type": "application/octet-stream",
+            "size": 32, "payload": b"x" * 32,
+        }])
+        assert len(saved) == 1
+        assert "path" not in saved[0]
+        assert "exceeds" in saved[0]["error"]
+        assert not (tmp_path / "attachments" / "42" / "big.bin").exists()
+
+    def test_extract_error_is_passed_through_without_writing(self, tmp_path):
+        saved = save_attachments("42", [{
+            "filename": "huge.pdf", "content_type": "application/pdf",
+            "size": 99, "payload": None, "error": "attachment exceeds 16 byte limit",
+        }])
+        assert saved[0]["error"] == "attachment exceeds 16 byte limit"
+        assert "path" not in saved[0]
+        assert list((tmp_path / "attachments" / "42").iterdir()) == []
+
+    def test_ok_part_still_saved_when_sibling_is_oversized(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("EMAIL_MAX_ATTACHMENT_BYTES", "8")
+        saved = save_attachments("42", [
+            {"filename": "ok.txt", "content_type": "text/plain",
+             "size": 2, "payload": b"hi"},
+            {"filename": "big.bin", "content_type": "application/octet-stream",
+             "size": 32, "payload": b"x" * 32},
+        ])
+        assert saved[0]["path"] == str(tmp_path / "attachments" / "42" / "ok.txt")
+        assert (tmp_path / "attachments" / "42" / "ok.txt").read_bytes() == b"hi"
+        assert "path" not in saved[1]
+        assert "exceeds" in saved[1]["error"]
+
 
 # ── message_to_dict ───────────────────────────────────────────────────────────
 
@@ -170,7 +213,8 @@ class TestSendReplyAttachments:
     def test_attaches_a_local_file(self, tmp_path):
         send_lock.queue_draft("1")
         send_lock.approve_send("1")
-        att_path = tmp_path / "report.txt"
+        att_path = tmp_path / "attachments" / "1" / "report.txt"
+        att_path.parent.mkdir(parents=True)
         att_path.write_bytes(b"quarterly numbers")
 
         server = _smtp_mock()
@@ -189,7 +233,7 @@ class TestSendReplyAttachments:
     def test_missing_attachment_fails_the_whole_send(self, tmp_path):
         send_lock.queue_draft("1")
         send_lock.approve_send("1")
-        missing_path = str(tmp_path / "does-not-exist.pdf")
+        missing_path = str(tmp_path / "attachments" / "1" / "does-not-exist.pdf")
 
         server = _smtp_mock()
         with patch("smtplib.SMTP_SSL", return_value=server):
@@ -203,6 +247,61 @@ class TestSendReplyAttachments:
         # Failure happens before the send — the approval isn't consumed,
         # so a corrected retry with the same email_id can still go through.
         assert send_lock.is_approved("1")
+
+    def test_path_outside_attachments_dir_is_rejected(self, tmp_path):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        secret = tmp_path / "send_locks.json"
+        secret.write_text("{}")
+
+        server = _smtp_mock()
+        with patch("smtplib.SMTP_SSL", return_value=server):
+            result = do_send_reply(
+                "a@b.com", "Re: hi", "body", email_id="1",
+                attachments=[str(secret)],
+            )
+        assert result["ok"] is False
+        assert "not allowed" in result["error"]
+        server.sendmail.assert_not_called()
+        assert send_lock.is_approved("1")
+
+    def test_relative_escape_outside_attachments_dir_is_rejected(self, tmp_path):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        (tmp_path / "attachments").mkdir()
+        secret = tmp_path / "secret.env"
+        secret.write_text("EMAIL_PASSWORD=hunter2")
+        escaped = str(tmp_path / "attachments" / ".." / "secret.env")
+
+        server = _smtp_mock()
+        with patch("smtplib.SMTP_SSL", return_value=server):
+            result = do_send_reply(
+                "a@b.com", "Re: hi", "body", email_id="1",
+                attachments=[escaped],
+            )
+        assert result["ok"] is False
+        assert "not allowed" in result["error"]
+        server.sendmail.assert_not_called()
+
+    def test_symlink_escaping_attachments_dir_is_rejected(self, tmp_path):
+        send_lock.queue_draft("1")
+        send_lock.approve_send("1")
+        secret = tmp_path / "credentials"
+        secret.write_text("password")
+        link_dir = tmp_path / "attachments" / "1"
+        link_dir.mkdir(parents=True)
+        link = link_dir / "leak"
+        link.symlink_to(secret)
+
+        server = _smtp_mock()
+        with patch("smtplib.SMTP_SSL", return_value=server):
+            result = do_send_reply(
+                "a@b.com", "Re: hi", "body", email_id="1",
+                attachments=[str(link)],
+            )
+        assert result["ok"] is False
+        assert "not allowed" in result["error"]
+        server.sendmail.assert_not_called()
 
     def test_no_attachments_produces_no_attachment_part(self):
         send_lock.queue_draft("1")

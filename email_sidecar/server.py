@@ -50,6 +50,8 @@ def fetch_unread() -> list[dict]:
     'attachments' is a list of {filename, content_type, size, path} — each
     file has already been saved to local disk at 'path'; use that path to
     read the file or to pass it back to send_reply's 'attachments' arg.
+    Parts over EMAIL_MAX_ATTACHMENT_BYTES (default 10 MiB) are not written;
+    they appear with an 'error' key and no 'path'.
     """
     return do_fetch_unread()
 
@@ -136,11 +138,11 @@ def send_reply(
                       the message and appear in the visible Cc header —
                       include anyone the owner wants kept in the loop (e.g.
                       a 'cc' address from fetch_unread's original thread).
-        attachments  Optional list of local file paths to attach — e.g. a
-                      'path' from a fetch_unread attachment, to forward it
-                      along, or any other file readable on this host. A
-                      missing path fails the whole send rather than sending
-                      without it.
+        attachments  Optional list of local file paths to attach. Each path
+                      must resolve under $HERMES_HOME/attachments/ (e.g. a
+                      'path' from fetch_unread). Paths outside that directory
+                      — including via symlink — are refused. A missing path
+                      fails the whole send rather than sending without it.
 
     Returns {"ok": true} or {"ok": false, "error": "..."}.
     """
