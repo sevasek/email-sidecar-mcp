@@ -8,13 +8,17 @@ server.py wraps these functions as MCP tools.
 from __future__ import annotations
 import email
 import imaplib
+import mimetypes
 import os
 import smtplib
 import ssl
 import time
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
+from pathlib import Path
 
 from email_sidecar import send_lock
 
@@ -29,6 +33,21 @@ SMTP_PORT          = int(os.environ.get("EMAIL_SMTP_PORT",      "465"))
 SMTP_USE_STARTTLS    = os.environ.get("EMAIL_SMTP_USE_STARTTLS",    "")
 SMTP_USE_IMPLICIT_SSL = os.environ.get("EMAIL_SMTP_USE_IMPLICIT_SSL", "")
 SENDER_NAME        = os.environ.get("EMAIL_SENDER_NAME",         "")
+
+# Default cap on a single inbound attachment (decoded bytes). Read at call
+# time via _max_attachment_bytes() so tests can override EMAIL_MAX_ATTACHMENT_BYTES.
+_DEFAULT_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+
+
+def _max_attachment_bytes() -> int:
+    raw = os.environ.get("EMAIL_MAX_ATTACHMENT_BYTES", "").strip()
+    if raw:
+        return int(raw)
+    return _DEFAULT_MAX_ATTACHMENT_BYTES
+
+
+def _size_limit_error(limit: int) -> str:
+    return f"attachment exceeds {limit} byte limit"
 
 # ── Reply-loop detection ──────────────────────────────────────────────────────
 
@@ -107,18 +126,139 @@ def parse_references(msg: email.message.Message) -> list[str]:
     return result
 
 
+def extract_attachments(msg: email.message.Message) -> list[dict]:
+    """Return non-body parts (explicit attachments + named inline parts) with raw bytes.
+
+    A part counts as an attachment if it's flagged Content-Disposition:
+    attachment, or it carries a filename at all (covers inline images/files
+    some clients send without an explicit disposition). get_body() already
+    excludes anything with "attachment" in its disposition from the body
+    text, so the two don't double up on a plain attachment.
+
+    Parts over EMAIL_MAX_ATTACHMENT_BYTES (default 10 MiB) are returned with
+    payload=None and an `error` instead of decoded bytes.
+    """
+    attachments = []
+    if not msg.is_multipart():
+        return attachments
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disposition = str(part.get("Content-Disposition", ""))
+        filename = part.get_filename()
+        if not filename and "attachment" not in disposition.lower():
+            continue
+        limit = _max_attachment_bytes()
+        encoded = part.get_payload(decode=False)
+        # Skip decode when the encoded form already cannot fit the cap
+        # (base64 is ~4/3 of decoded size). Avoids a second huge allocation.
+        if isinstance(encoded, (str, bytes)) and len(encoded) > (limit * 4 // 3) + 8:
+            attachments.append({
+                "filename":     filename or "attachment",
+                "content_type": part.get_content_type(),
+                "size":         len(encoded),
+                "payload":      None,
+                "error":        _size_limit_error(limit),
+            })
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        if len(payload) > limit:
+            attachments.append({
+                "filename":     filename or "attachment",
+                "content_type": part.get_content_type(),
+                "size":         len(payload),
+                "payload":      None,
+                "error":        _size_limit_error(limit),
+            })
+            continue
+        attachments.append({
+            "filename":     filename or "attachment",
+            "content_type": part.get_content_type(),
+            "size":         len(payload),
+            "payload":      payload,
+        })
+    return attachments
+
+
+def _attachments_base_dir() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "/opt/data")) / "attachments"
+
+
+def save_attachments(uid: str, attachments: list[dict]) -> list[dict]:
+    """Persist extracted attachment bytes to disk, keyed by message uid.
+
+    Returns metadata dicts (filename, content_type, size, path) with the raw
+    payload dropped — the path is what Hermes/Willow actually needs to pick
+    the file back up and forward it on (e.g. via Telegram).
+
+    Oversized or already-errored parts are returned with an `error` key and
+    no `path` (nothing is written). A write failure on one file does not
+    abort the rest.
+    """
+    if not attachments:
+        return []
+    out_dir = _attachments_base_dir() / uid
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return [{
+            "filename":     att.get("filename", ""),
+            "content_type": att.get("content_type", ""),
+            "size":         att.get("size", 0),
+            "error":        str(exc),
+        } for att in attachments]
+    saved = []
+    limit = _max_attachment_bytes()
+    for i, att in enumerate(attachments):
+        meta = {
+            "filename":     att["filename"],
+            "content_type": att["content_type"],
+            "size":         att["size"],
+        }
+        if att.get("error"):
+            meta["error"] = att["error"]
+            saved.append(meta)
+            continue
+        payload = att.get("payload")
+        if not payload:
+            meta["error"] = "empty attachment"
+            saved.append(meta)
+            continue
+        if len(payload) > limit:
+            meta["error"] = _size_limit_error(limit)
+            saved.append(meta)
+            continue
+        safe_name = os.path.basename(att["filename"]) or f"attachment-{i}"
+        path = out_dir / safe_name
+        if path.exists():
+            stem, suffix = os.path.splitext(safe_name)
+            path = out_dir / f"{stem}-{i}{suffix}"
+        try:
+            path.write_bytes(payload)
+        except OSError as exc:
+            meta["error"] = str(exc)
+            saved.append(meta)
+            continue
+        meta["path"] = str(path)
+        saved.append(meta)
+    return saved
+
+
 def message_to_dict(uid: bytes, msg: email.message.Message) -> dict:
     """Convert a parsed email.message.Message to a plain dict for Hermes."""
     return {
-        "id":         uid.decode(),
-        "from":       msg.get("From", ""),
-        "to":         msg.get("To", ""),
-        "cc":         msg.get("Cc", ""),
-        "subject":    msg.get("Subject", ""),
-        "date":       msg.get("Date", ""),
-        "message_id": msg.get("Message-ID", "").strip(),
-        "references": parse_references(msg),
-        "body":       get_body(msg),
+        "id":          uid.decode(),
+        "from":        msg.get("From", ""),
+        "to":          msg.get("To", ""),
+        "cc":          msg.get("Cc", ""),
+        "subject":     msg.get("Subject", ""),
+        "date":        msg.get("Date", ""),
+        "message_id":  msg.get("Message-ID", "").strip(),
+        "references":  parse_references(msg),
+        "body":        get_body(msg),
+        "attachments": [],
     }
 
 
@@ -218,6 +358,15 @@ def do_fetch_unread() -> list[dict]:
                 move_to_archive(conn, uid)
                 continue
             record = message_to_dict(uid, msg)
+            try:
+                record["attachments"] = save_attachments(
+                    record["id"], extract_attachments(msg)
+                )
+            except Exception as exc:
+                # One bad attachment must not abort the rest of the inbox poll.
+                record["attachments"] = [{
+                    "filename": "", "content_type": "", "size": 0, "error": str(exc),
+                }]
             record["thread"] = fetch_thread_context(conn, record["references"])
             results.append(record)
     finally:
@@ -244,6 +393,42 @@ def do_discard_draft(email_id: str) -> dict:
     return send_lock.discard(email_id)
 
 
+def _resolve_outbound_attachment(path: str) -> Path:
+    """Resolve path and require it to stay under $HERMES_HOME/attachments/.
+
+    Follows symlinks, so a link planted inside the attachments dir that
+    points outside is rejected. Missing files under the dir raise
+    FileNotFoundError; anything that resolves outside raises ValueError.
+    """
+    base = _attachments_base_dir().resolve()
+    file_path = Path(path).expanduser().resolve()
+    try:
+        file_path.relative_to(base)
+    except ValueError:
+        raise ValueError(
+            f"attachment path not allowed: {path} (must be under {base})"
+        ) from None
+    if not file_path.is_file():
+        raise FileNotFoundError(f"attachment not found: {path}")
+    return file_path
+
+
+def _attach_file(msg: MIMEMultipart, path: str) -> None:
+    """Read an allowed local file and attach it to msg.
+
+    Raises FileNotFoundError if missing, ValueError if the path resolves
+    outside $HERMES_HOME/attachments/.
+    """
+    file_path = _resolve_outbound_attachment(path)
+    content_type, _ = mimetypes.guess_type(file_path.name)
+    maintype, _, subtype = (content_type or "application/octet-stream").partition("/")
+    part = MIMEBase(maintype, subtype or "octet-stream")
+    part.set_payload(file_path.read_bytes())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename=file_path.name)
+    msg.attach(part)
+
+
 def do_send_reply(
     to: str,
     subject: str,
@@ -252,6 +437,7 @@ def do_send_reply(
     references: list[str] | None = None,
     email_id: str = "",
     cc: list[str] | None = None,
+    attachments: list[str] | None = None,
 ) -> dict:
     """Send a reply via SMTP with an explicit Date header.
 
@@ -263,6 +449,11 @@ def do_send_reply(
     cc, if given, is added both as an envelope recipient (so the addresses
     actually receive the message — setting the Cc header alone does not)
     and as the visible Cc header.
+
+    attachments, if given, is a list of local file paths that resolve under
+    $HERMES_HOME/attachments/ (typically a path fetch_unread saved). A
+    missing file, or a path that escapes that directory (including via
+    symlink), fails the whole send rather than going out silently without it.
     """
     if not send_lock.is_approved(email_id):
         return {
@@ -273,7 +464,13 @@ def do_send_reply(
         }
     try:
         cc = cc or []
-        msg = MIMEMultipart("alternative")
+        attachments = attachments or []
+        body_part = MIMEMultipart("alternative")
+        body_part.attach(MIMEText(body, "plain", "utf-8"))
+        msg = MIMEMultipart("mixed") if attachments else body_part
+        if attachments:
+            msg.attach(body_part)
+
         from_header = EMAIL_ADDRESS if not SENDER_NAME else f"{SENDER_NAME} <{EMAIL_ADDRESS}>"
         msg["From"]    = from_header
         msg["To"]      = to
@@ -289,7 +486,8 @@ def do_send_reply(
                 [in_reply_to] if in_reply_to and in_reply_to not in references else []
             )
             msg["References"] = " ".join(all_refs)
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        for path in attachments:
+            _attach_file(msg, path)
 
         use_implicit = SMTP_USE_IMPLICIT_SSL == "1" or (
             SMTP_PORT == 465 and SMTP_USE_STARTTLS != "1"

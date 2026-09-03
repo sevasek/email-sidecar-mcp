@@ -5,10 +5,10 @@ Email sidecar MCP server.
 Thin MCP wrapper around email_sidecar/logic.py.
 Exposes seven tools to an MCP client (e.g. Hermes Agent) over stdio transport:
 
-  fetch_unread   Unread emails with thread context. Automated mail silently archived.
+  fetch_unread   Unread emails with thread context and saved attachments. Automated mail silently archived.
   queue_draft    Register a posted draft as pending owner approval.
   approve_send   Approve a queued draft — only call from the owner-reply session.
-  send_reply     SMTP send with explicit RFC 5322 Date header. Refuses unsent, unapproved drafts.
+  send_reply     SMTP send with explicit RFC 5322 Date header and optional attachments. Refuses unsent, unapproved drafts.
   discard_draft  Drop a queued draft without sending it.
   mark_read      Mark a message as Seen.
   archive        Move a message to archive without replying.
@@ -41,11 +41,17 @@ def fetch_unread() -> list[dict]:
     Hermes never sees them.
 
     Each returned email contains:
-      id, from, to, cc, subject, date, message_id, references, body, thread
+      id, from, to, cc, subject, date, message_id, references, body,
+      attachments, thread
 
     Use 'id' in mark_read / archive / queue_draft / approve_send / discard_draft / send_reply's email_id.
     Use 'message_id' as 'in_reply_to' when calling send_reply.
     'thread' is a list of up to 3 prior messages for context (chronological order).
+    'attachments' is a list of {filename, content_type, size, path} — each
+    file has already been saved to local disk at 'path'; use that path to
+    read the file or to pass it back to send_reply's 'attachments' arg.
+    Parts over EMAIL_MAX_ATTACHMENT_BYTES (default 10 MiB) are not written;
+    they appear with an 'error' key and no 'path'.
     """
     return do_fetch_unread()
 
@@ -111,6 +117,7 @@ def send_reply(
     references: list[str] | None = None,
     email_id: str = "",
     cc: list[str] | None = None,
+    attachments: list[str] | None = None,
 ) -> dict:
     """
     Send an email reply via SMTP.
@@ -131,10 +138,15 @@ def send_reply(
                       the message and appear in the visible Cc header —
                       include anyone the owner wants kept in the loop (e.g.
                       a 'cc' address from fetch_unread's original thread).
+        attachments  Optional list of local file paths to attach. Each path
+                      must resolve under $HERMES_HOME/attachments/ (e.g. a
+                      'path' from fetch_unread). Paths outside that directory
+                      — including via symlink — are refused. A missing path
+                      fails the whole send rather than sending without it.
 
     Returns {"ok": true} or {"ok": false, "error": "..."}.
     """
-    return do_send_reply(to, subject, body, in_reply_to, references, email_id, cc)
+    return do_send_reply(to, subject, body, in_reply_to, references, email_id, cc, attachments)
 
 
 @mcp.tool()
