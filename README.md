@@ -40,12 +40,15 @@ Two things stay out of the LLM's hands by design:
 `{filename, content_type, size, path}` — in that message's `attachments`
 list. Nothing is inlined as base64 into the tool response; the path is a
 local file the calling process (Hermes/Willow) reads directly, since the
-stdio MCP transport means it already shares this filesystem.
+stdio MCP transport means it already shares this filesystem. A single part
+larger than `EMAIL_MAX_ATTACHMENT_BYTES` (default 10 MiB) is not written;
+the metadata entry has an `error` and no `path`.
 
 `send_reply` accepts an `attachments` arg — a list of local file paths
-(an inbound attachment's `path`, or any other file readable on this host)
-to attach to the outgoing message. A missing path fails the send rather
-than going out silently without it.
+that resolve under `$HERMES_HOME/attachments/` (typically an inbound
+attachment's `path`). Paths outside that directory, including via
+symlink, are refused. A missing path fails the send rather than going
+out silently without it.
 
 ## Install
 
